@@ -425,6 +425,13 @@ async function renderPerformance(id) {
 }
 
 function drawPerformance(id, { performance: perf, continuation, continue_targets: targets, cues, events, review_requests: reviewRequests }) {
+  // 2.5s 轮询整体重绘：记住当前焦点与光标位置，重绘后恢复，避免输入被打断
+  const active = document.activeElement;
+  const focusKey = active && (active.dataset.focusKey || (active.id === 'operator-input' ? 'operator' : null));
+  const caret = active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')
+    ? { start: active.selectionStart, end: active.selectionEnd }
+    : null;
+
   const counts = { pending: 0, fired: 0, skipped: 0, blocked: 0 };
   cues.forEach(c => counts[c.status]++);
   const requests = reviewRequests || [];
@@ -433,9 +440,13 @@ function drawPerformance(id, { performance: perf, continuation, continue_targets
   const readonly = !!(continuation && continuation.readonly);
   const carriedCount = events.filter(e => e.source === 'carried').length;
 
-  const opVal = document.getElementById('operator-input')
-    ? document.getElementById('operator-input').value
-    : (localStorage.getItem('operator') || '');
+  // 正在操作人框中输入时保留 DOM 中的实时值（下方 innerHTML 重绘前取出），避免光标跳尾
+  const opFocused = focusKey === 'operator';
+  const opVal = opFocused && active
+    ? active.value
+    : (document.getElementById('operator-input')
+        ? document.getElementById('operator-input').value
+        : (localStorage.getItem('operator') || ''));
 
   app.innerHTML = `
     <div class="perf-head">
@@ -457,6 +468,7 @@ function drawPerformance(id, { performance: perf, continuation, continue_targets
       </div>
     </div>
     ${renderContinuationBanner(perf, continuation, carriedCount)}
+    ${readonly ? '' : '<div id="batch-panel-mount"></div>'}
     ${readonly ? '' : '<div id="continue-panel-mount"></div>'}
     <div class="grid-2">
       <div id="cue-list">
@@ -540,7 +552,240 @@ function drawPerformance(id, { performance: perf, continuation, continue_targets
     };
   });
 
+  drawBatchPanel(id, cues);
   drawContinuePanel(id, targets || []);
+
+  // 恢复焦点（轮询重绘不打断操作人/成组表单输入）
+  if (focusKey) {
+    const sel = focusKey === 'operator'
+      ? document.getElementById('operator-input')
+      : document.querySelector(`[data-focus-key="${CSS.escape(focusKey)}"]`);
+    if (sel) {
+      sel.focus();
+      if (caret && sel.setSelectionRange) {
+        try { sel.setSelectionRange(caret.start, caret.end); } catch (_) {}
+      }
+    }
+  }
+}
+
+/* ---------- 现场成组处置面板 ---------- */
+
+// 成组面板状态按演出记忆：清单编辑内容与最近一次逐项预览（轮询重绘不丢失操作现场）
+const batchUiState = new Map();
+function getBatchState(perfId) {
+  if (!batchUiState.has(perfId)) {
+    batchUiState.set(perfId, { open: true, rows: [emptyBatchRow()], preview: null });
+  }
+  return batchUiState.get(perfId);
+}
+function emptyBatchRow() {
+  return { label: '', action: 'fire', reason: '' };
+}
+const BATCH_ACTION_TEXTS = { fire: '触发', skip: '跳过', retract: '撤回' };
+
+function collectBatchRows(st) {
+  st.rows = st.rows.map(r => ({
+    label: r.label.trim(),
+    action: BATCH_ACTION_TEXTS[r.action] ? r.action : 'fire',
+    reason: r.reason.trim(),
+  }));
+  return st.rows;
+}
+
+function drawBatchPanel(perfId, cues) {
+  const mount = document.getElementById('batch-panel-mount');
+  if (!mount) return;
+  const st = getBatchState(perfId);
+  if (!st.open) {
+    mount.innerHTML = `
+      <div class="panel batch-panel collapsed">
+        <div class="row">
+          <b>📋 成组连续处置</b>
+          <span class="muted">按顺序逐项触发 / 跳过 / 撤回，先预览判定再整组提交（需双人复核的提示请走单项申请）</span>
+          <span class="grow"></span>
+          <button class="ghost small" id="batch-toggle">展开</button>
+        </div>
+      </div>`;
+    document.getElementById('batch-toggle').onclick = () => { st.open = true; drawBatchPanel(perfId, cues); };
+    return;
+  }
+
+  const labels = cues.map(c => c.label);
+  mount.innerHTML = `
+    <div class="panel batch-panel">
+      <div class="row">
+        <b>📋 成组连续处置</b>
+        <span class="muted">按清单顺序逐项判定：前置、下游撤回保护、待复核限制均以前面步骤的有效结果为准；整组全部通过才依次落流水</span>
+        <span class="grow"></span>
+        <button class="ghost small" id="batch-toggle">收起</button>
+      </div>
+      <div class="batch-table-wrap">
+        <table class="batch-table">
+          <thead><tr><th style="width:42px">#</th><th style="width:130px">编号</th><th style="width:96px">动作</th><th>跳过 / 撤回原因（触发无需填写）</th><th style="width:42px"></th></tr></thead>
+          <tbody>
+            ${st.rows.map((r, i) => `
+              <tr>
+                <td class="muted">${i + 1}</td>
+                <td><input class="batch-label" type="text" list="cue-labels-${perfId}" data-focus-key="batch-${perfId}-label-${i}" value="${esc(r.label)}" placeholder="如 L2"></td>
+                <td>
+                  <select class="batch-action" data-focus-key="batch-${perfId}-action-${i}">
+                    <option value="fire" ${r.action === 'fire' ? 'selected' : ''}>触发</option>
+                    <option value="skip" ${r.action === 'skip' ? 'selected' : ''}>跳过</option>
+                    <option value="retract" ${r.action === 'retract' ? 'selected' : ''}>撤回</option>
+                  </select>
+                </td>
+                <td><input class="batch-reason" type="text" data-focus-key="batch-${perfId}-reason-${i}" value="${esc(r.reason)}" placeholder="${r.action === 'skip' ? '跳过原因（必填）' : r.action === 'retract' ? '撤回原因（必填）' : '触发无需原因'}" ${r.action === 'fire' ? 'disabled' : ''}></td>
+                <td><button class="ghost danger small batch-del" data-i="${i}" ${st.rows.length === 1 ? 'disabled' : ''}>删</button></td>
+              </tr>`).join('')}
+          </tbody>
+        </table>
+        <datalist id="cue-labels-${perfId}">
+          ${labels.map(l => `<option value="${esc(l)}"></option>`).join('')}
+        </datalist>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="ghost small" id="batch-add">＋ 添加一项</button>
+        <span class="grow"></span>
+        <button class="ghost" id="batch-preview">逐项预览</button>
+        <button class="big" id="batch-submit">整组提交</button>
+      </div>
+      <div id="batch-result"></div>
+    </div>`;
+
+  const bindRowInputs = () => {
+    mount.querySelectorAll('tbody tr').forEach((tr, i) => {
+      const labelEl = tr.querySelector('.batch-label');
+      const actionSel = tr.querySelector('.batch-action');
+      const reasonEl = tr.querySelector('.batch-reason');
+      labelEl.oninput = () => { st.rows[i].label = labelEl.value; st.preview = null; };
+      actionSel.onchange = () => {
+        st.rows[i].action = actionSel.value;
+        if (actionSel.value === 'fire') st.rows[i].reason = '';
+        st.preview = null;
+        drawBatchPanel(perfId, cues);
+      };
+      reasonEl.oninput = () => { st.rows[i].reason = reasonEl.value; st.preview = null; };
+      tr.querySelector('.batch-del').onclick = () => {
+        st.rows.splice(i, 1);
+        st.preview = null;
+        drawBatchPanel(perfId, cues);
+      };
+    });
+  };
+  bindRowInputs();
+
+  document.getElementById('batch-toggle').onclick = () => { st.open = false; drawBatchPanel(perfId, cues); };
+  document.getElementById('batch-add').onclick = () => {
+    st.rows.push(emptyBatchRow());
+    st.preview = null;
+    drawBatchPanel(perfId, cues);
+  };
+  document.getElementById('batch-preview').onclick = () => doBatchPreview(perfId, cues);
+  document.getElementById('batch-submit').onclick = () => doBatchSubmit(perfId, cues);
+  renderBatchResult(perfId);
+}
+
+function renderBatchResult(perfId) {
+  const box = document.getElementById('batch-result');
+  if (!box) return;
+  const st = getBatchState(perfId);
+  const pv = st.preview;
+  if (!pv) {
+    box.innerHTML = '<p class="muted" style="margin:8px 0 0">按现场顺序填写编号与动作后「逐项预览」：每一步会基于前面步骤的有效结果判定前置、下游与待复核限制。</p>';
+    return;
+  }
+  const rowsHtml = pv.results.map(r => `
+    <tr class="${r.ok ? 'batch-ok' : 'batch-fail'}">
+      <td>${r.index}</td>
+      <td><b>${esc(r.label)}</b></td>
+      <td>${BATCH_ACTION_TEXTS[r.action] || r.action}${r.ok && r.planned ? ' <span class="hint-flag flag-carried">拟执行</span>' : ''}</td>
+      <td>${r.ok
+        ? `<span class="status fired">✓ 通过</span>${r.reason ? '<div class="muted">' + esc(r.reason) + '</div>' : ''}`
+        : `<span class="status blocked">✗ ${esc(r.error)}</span>`}</td>
+    </tr>`).join('');
+  const head = pv.can_submit
+    ? `<div class="ok-box">✓ 逐项预览全部通过（${pv.success_count} 项）：提交时按最新状态重新逐项判定，全部通过才依次写入与单项一致的流水。</div>`
+    : `<div class="error-list"><b>预览发现 ${pv.failure_count} 项不能执行（${pv.success_count} 项可执行）：</b>请按失败项调整清单后再提交；正式提交时任一项失败，整组均不产生流水。</div>`;
+  box.innerHTML = `
+    ${head}
+    <div class="hint-table-wrap">
+      <table class="hint-table batch-preview-table">
+        <thead><tr><th style="width:42px">序号</th><th style="width:110px">编号</th><th style="width:150px">动作</th><th>判定结果 / 失败原因</th></tr></thead>
+        <tbody>${rowsHtml}</tbody>
+      </table>
+    </div>`;
+}
+
+async function doBatchPreview(perfId) {
+  const st = getBatchState(perfId);
+  const operator = getOperator();
+  if (!operator) { toast('请先填写本组操作人（顶部操作人输入框）', true); return document.getElementById('operator-input').focus(); }
+  collectBatchRows(st);
+  if (!st.rows.length) return toast('成组清单为空', true);
+  try {
+    st.preview = await api(`/api/performances/${perfId}/batch/preview`, {
+      method: 'POST',
+      body: { operator, items: st.rows.map(r => ({ label: r.label, action: r.action, reason: r.reason })) },
+    });
+    renderBatchResult(perfId);
+  } catch (e) {
+    st.preview = null;
+    toast(e.message, true);
+    renderBatchResult(perfId);
+  }
+}
+
+async function doBatchSubmit(perfId, cues) {
+  const st = getBatchState(perfId);
+  const operator = getOperator();
+  if (!operator) { toast('请先填写本组操作人（顶部操作人输入框）', true); return document.getElementById('operator-input').focus(); }
+  collectBatchRows(st);
+  if (!st.rows.length) return toast('成组清单为空', true);
+
+  // 提交前先按当前编辑做一次逐项预览（服务端事务内仍会按最新状态再判定一次）
+  let pv;
+  try {
+    pv = await api(`/api/performances/${perfId}/batch/preview`, {
+      method: 'POST',
+      body: { operator, items: st.rows.map(r => ({ label: r.label, action: r.action, reason: r.reason })) },
+    });
+    st.preview = pv;
+    renderBatchResult(perfId);
+  } catch (e) {
+    st.preview = null;
+    renderBatchResult(perfId);
+    return toast(e.message, true);
+  }
+  if (!pv.can_submit) {
+    return toast('逐项预览存在失败项，请调整后再提交', true);
+  }
+  if (!window.confirm(`成组 ${pv.success_count} 项预览均通过。确认按顺序整组提交？\n（提交瞬间按最新状态重新判定，任一项失败则整组不产生流水）`)) return;
+
+  try {
+    const r = await api(`/api/performances/${perfId}/batch`, {
+      method: 'POST',
+      body: { operator, items: st.rows.map(row2 => ({ label: row2.label, action: row2.action, reason: row2.reason })) },
+    });
+    st.rows = [emptyBatchRow()];
+    st.preview = null;
+    toast(`成组提交成功：已依次写入 ${r.success_count} 条执行流水`);
+  } catch (e) {
+    // 服务端事务内重新判定发现失败：整组未生效、无流水；用返回的逐项结果替换预览
+    if (e.data && Array.isArray(e.data.results)) {
+      st.preview = {
+        results: e.data.results,
+        success_count: e.data.success_count,
+        failure_count: e.data.failure_count,
+        can_submit: false,
+      };
+      renderBatchResult(perfId);
+    }
+    toast(e.message, true);
+  }
+  // 成功或失败都重新拉取执行台最新状态（成功后提示卡片/流水更新）
+  stopPolling();
+  renderPerformance(perfId);
 }
 
 /* ---------- 接续关系横幅与接续面板 ---------- */

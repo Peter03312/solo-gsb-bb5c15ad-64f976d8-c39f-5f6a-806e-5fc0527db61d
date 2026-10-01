@@ -992,6 +992,324 @@ route('POST', '/api/performances/:id/continue', (body, p) => {
   return continuePerformance(perf, target, operator, name);
 });
 
+/* ---- 现场成组处置（逐项预览 + 整组提交；与单项 / 接续同一 BEGIN IMMEDIATE 串行判定） ---- */
+
+const BATCH_ACTIONS = ['fire', 'skip', 'retract'];
+const BATCH_ACTION_TEXT = { fire: '触发', skip: '跳过', retract: '撤回' };
+const BATCH_MAX_ITEMS = 500;
+
+/**
+ * 解析成组请求体并做整组结构校验：本组操作人必填；items 为非空数组（≤500）；
+ * 每项编号非空、动作合法；编号不得重复。任一不满足直接拒绝（不进入逐项判定）。
+ */
+function parseGroupBody(body) {
+  const operator = String(body.operator || '').trim().slice(0, 50);
+  if (!operator) throw new HttpError(400, '请填写本组操作人');
+  if (!Array.isArray(body.items)) throw new HttpError(400, '请求格式错误：items 应为数组');
+  if (body.items.length === 0) throw new HttpError(400, '成组操作清单为空：请至少添加一项');
+  if (body.items.length > BATCH_MAX_ITEMS) throw new HttpError(400, `成组操作项过多（上限 ${BATCH_MAX_ITEMS} 项）`);
+
+  const items = body.items.map((raw, i) => {
+    const label = String((raw && raw.label) != null ? raw.label : '').trim().slice(0, 50);
+    const action = String((raw && raw.action) || '').trim();
+    const reason = String((raw && raw.reason) != null ? raw.reason : '').trim().slice(0, 200);
+    if (!label) throw new HttpError(400, `第 ${i + 1} 项：提示编号不能为空`);
+    if (!BATCH_ACTIONS.includes(action)) {
+      throw new HttpError(400, `第 ${i + 1} 项（编号 ${label}）：动作无效，应为 fire / skip / retract`);
+    }
+    return { label, action, reason };
+  });
+
+  const seen = new Set();
+  items.forEach((it, i) => {
+    if (seen.has(it.label)) {
+      throw new HttpError(400, `第 ${i + 1} 项：编号「${it.label}」在本组清单中重复，每个编号只能出现一次`);
+    }
+    seen.add(it.label);
+  });
+
+  return { operator, items };
+}
+
+/**
+ * 逐项判定成组处置（核心规则与单项接口完全一致）：
+ *  - 按清单顺序逐项处理，每一步基于前序步骤产生的有效结果判定（前置满足、下游保护、待复核限制）；
+ *  - 任一项失败只记录该项失败原因，不影响后续项的预览判定（dryRun 时失败项不产生有效结果）；
+ *  - dryRun=true（预览）：不写任何数据，成功项以拟操作参与后续判定；
+ *  - dryRun=false（提交）：调用方须已持有 BEGIN IMMEDIATE 事务并确认演出可操作；成功项立即写入
+ *    与单项一致的 manual 流水，任一项失败由调用方整体回滚（整组不产生流水）。
+ * 返回 { results, success_count, failure_count, can_submit }。
+ */
+function evaluateBatch(perf, operator, items, dryRun) {
+  const versionId = perf.version_id;
+  const cues = getVersionCues(versionId);
+  const byLabel = new Map(cues.map((c) => [c.label, c]));
+
+  // 可变状态：初始为演出当前有效结果，前序成功项实时改写（同一内存快照内串行判定）
+  const latestByCue = latestEventsByCue(perf.id);
+  const firedLabels = new Set();
+  for (const c of cues) {
+    const e = latestByCue.get(c.id);
+    if (e && e.action === 'fired') firedLabels.add(c.label);
+  }
+
+  const pendingRows = db.prepare(
+    "SELECT * FROM cue_review_requests WHERE performance_id = ? AND status = 'pending' ORDER BY id"
+  ).all(perf.id);
+  const pendingByCue = new Map(pendingRows.map((r) => [r.cue_id, r]));
+
+  // 前置关系反向索引（撤回时的下游保护）
+  const childrenOf = new Map();
+  for (const c of cues) {
+    for (const dep of c.deps) {
+      if (!childrenOf.has(dep)) childrenOf.set(dep, []);
+      childrenOf.get(dep).push(c);
+    }
+  }
+
+  const insertEvent = db.prepare(
+    'INSERT INTO cue_events (performance_id, cue_id, action, operator, reason) VALUES (?,?,?,?,?)'
+  );
+  const getEvent = (id) => db.prepare('SELECT * FROM cue_events WHERE id = ?').get(id);
+
+  const results = [];
+  let successCount = 0;
+  let failureCount = 0;
+
+  function recordFailure(item, i, cue, status, message, extra) {
+    failureCount += 1;
+    results.push({
+      index: i + 1,
+      seq: cue ? cue.seq : null,
+      cue_id: cue ? cue.id : null,
+      label: item.label,
+      action: item.action,
+      ok: false,
+      status,
+      error: message,
+      ...(extra || {}),
+    });
+  }
+
+  function recordSuccess(item, i, cue, action, reason) {
+    let event;
+    if (dryRun) {
+      // 预览：以拟操作更新内存状态供后续项判定，不写库
+      event = {
+        id: null, performance_id: perf.id, cue_id: cue.id, action,
+        operator, reason, created_at: null, source: 'manual',
+      };
+    } else {
+      const info = insertEvent.run(perf.id, cue.id, action, operator, reason);
+      event = getEvent(Number(info.lastInsertRowid));
+    }
+    latestByCue.set(cue.id, event);
+    if (action === 'fired') firedLabels.add(cue.label);
+    if (action === 'retracted') firedLabels.delete(cue.label);
+    successCount += 1;
+    results.push({
+      index: i + 1,
+      seq: cue.seq,
+      cue_id: cue.id,
+      label: cue.label,
+      action: item.action,
+      ok: true,
+      operator,
+      reason,
+      planned: dryRun,
+      event: dryRun ? null : event,
+    });
+  }
+
+  items.forEach((item, i) => {
+    const cue = byLabel.get(item.label);
+    if (!cue) {
+      recordFailure(item, i, null, 404, `提示编号「${item.label}」不存在于当前演出版本`);
+      return;
+    }
+
+    const pending = pendingByCue.get(cue.id) || null;
+    const latest = latestByCue.get(cue.id) || null;
+    const effective = effectiveAction(latest);
+
+    if (item.action === 'fire') {
+      // 与单项 fire 相同的状态判定；需双人复核提示禁止成组直接触发（不能绕过申请—确认）
+      if (effective) {
+        recordFailure(
+          item, i, cue, 409,
+          `该提示已有结果：${ACTION_TEXT[effective]}（操作人 ${latest.operator}，时间 ${latest.created_at}）`,
+          { current: latest }
+        );
+        return;
+      }
+      if (pending) {
+        recordFailure(
+          item, i, cue, 409,
+          `该提示存在待复核的触发申请（申请人 ${pending.requested_by}，时间 ${pending.requested_at}），复核处置前不能触发`,
+          { request: pending }
+        );
+        return;
+      }
+      if (cue.needs_review) {
+        recordFailure(item, i, cue, 409, '该提示需双人复核，不能在成组操作中直接触发；请先在执行台发起触发申请，并由另一操作人确认');
+        return;
+      }
+      const unmet = cue.deps.filter((d) => !firedLabels.has(d));
+      if (unmet.length) {
+        recordFailure(item, i, cue, 422, `前置提示未触发，无法触发：${unmet.join('、')}`, { unmet });
+        return;
+      }
+      recordSuccess(item, i, cue, 'fired', null);
+      return;
+    }
+
+    if (item.action === 'skip') {
+      if (effective) {
+        recordFailure(
+          item, i, cue, 409,
+          `该提示已有结果：${ACTION_TEXT[effective]}（操作人 ${latest.operator}，时间 ${latest.created_at}）`,
+          { current: latest }
+        );
+        return;
+      }
+      if (pending) {
+        recordFailure(
+          item, i, cue, 409,
+          `该提示存在待复核的触发申请（申请人 ${pending.requested_by}，时间 ${pending.requested_at}），复核处置前不能跳过`,
+          { request: pending }
+        );
+        return;
+      }
+      if (!item.reason) {
+        recordFailure(item, i, cue, 400, '跳过必须填写原因');
+        return;
+      }
+      recordSuccess(item, i, cue, 'skipped', item.reason);
+      return;
+    }
+
+    // retract：与单项撤回一致（待复核拒绝 / 已跳过或未触发拒绝 / 缺原因 / 下游仍已触发整体拒绝）
+    if (pending) {
+      recordFailure(
+        item, i, cue, 409,
+        `该提示存在待复核的触发申请（申请人 ${pending.requested_by}，时间 ${pending.requested_at}），复核处置前不能撤回`,
+        { request: pending }
+      );
+      return;
+    }
+    if (effective === 'skipped') {
+      recordFailure(
+        item, i, cue, 409,
+        `该提示当前结果为已跳过，不能撤回（操作人 ${latest.operator}，时间 ${latest.created_at}）`,
+        { current: latest }
+      );
+      return;
+    }
+    if (effective !== 'fired') {
+      recordFailure(item, i, cue, 409, '该提示当前未处于已触发状态，不能撤回', { current: latest });
+      return;
+    }
+    if (!item.reason) {
+      recordFailure(item, i, cue, 400, '撤回必须填写原因');
+      return;
+    }
+    // 反向 BFS：前序步骤刚撤回的下游已从 firedLabels 移除，判定随之级联
+    const affected = [];
+    const visited = new Set([cue.label]);
+    const queue = [cue.label];
+    while (queue.length) {
+      const curLabel = queue.shift();
+      for (const child of childrenOf.get(curLabel) || []) {
+        if (visited.has(child.label)) continue;
+        visited.add(child.label);
+        queue.push(child.label);
+        if (firedLabels.has(child.label)) affected.push(child.label);
+      }
+    }
+    if (affected.length) {
+      recordFailure(
+        item, i, cue, 409,
+        `无法撤回：以下后续提示仍处于已触发状态，请先撤回：${affected.join('、')}`,
+        { affected }
+      );
+      return;
+    }
+    recordSuccess(item, i, cue, 'retracted', item.reason);
+  });
+
+  return {
+    results,
+    success_count: successCount,
+    failure_count: failureCount,
+    can_submit: failureCount === 0,
+  };
+}
+
+/** 取演出并拒绝只读（已接续）演出：成组预览与提交均不允许在只读演出上进行 */
+function getActivePerformance(performanceId) {
+  const perf = db.prepare('SELECT * FROM performances WHERE id = ?').get(performanceId);
+  if (!perf) throw new HttpError(404, '演出不存在');
+  assertActiveInTx(perf);
+  return perf;
+}
+
+route('POST', '/api/performances/:id/batch/preview', (body, p) => {
+  const { operator, items } = parseGroupBody(body);
+  const perf = getActivePerformance(Number(p.id));
+  // Node 单线程同步读：快照内逐项判定，不会穿插其他写操作；不修改任何数据
+  const plan = evaluateBatch(perf, operator, items, true);
+  const version = db.prepare('SELECT id, version_number FROM versions WHERE id = ?').get(perf.version_id);
+  return {
+    performance: { id: perf.id, name: perf.name },
+    version,
+    operator,
+    ...plan,
+  };
+});
+
+route('POST', '/api/performances/:id/batch', (body, p) => {
+  const { operator, items } = parseGroupBody(body);
+  const perfId = Number(p.id);
+  return withTx(() => {
+    // 提交瞬间在 BEGIN IMMEDIATE 内重读最新状态并重新逐项判定：
+    // 与单项操作、接续串行，排队期间的任何现场变化都会纳入判定，不信任此前预览结果
+    const fresh = db.prepare('SELECT * FROM performances WHERE id = ?').get(perfId);
+    if (!fresh) throw new HttpError(404, '演出不存在');
+    assertActiveInTx(fresh);
+
+    const plan = evaluateBatch(fresh, operator, items, false);
+    if (plan.failure_count > 0) {
+      // 任一项失败：事务回滚，整组不产生任何流水（含此前各项的拟写入）。
+      // 清洗成功项上的拟写入事件（其 id 随回滚失效），统一标记为未生效，避免误以为已落库。
+      const rolledBackResults = plan.results.map((r) => r.ok
+        ? { ...r, event: null, rolled_back: true }
+        : r);
+      const overallStatus = rolledBackResults.some((r) => !r.ok && r.status === 422)
+        ? 422
+        : rolledBackResults.some((r) => !r.ok && r.status === 400)
+          ? 400
+          : 409;
+      const first = rolledBackResults.find((r) => !r.ok);
+      throw new HttpError(
+        overallStatus,
+        `成组操作未执行：第 ${first.index} 项（编号 ${first.label}）${first.error}。整组均未生效、无流水产生，请调整后重新提交`,
+        {
+          results: rolledBackResults,
+          success_count: 0,
+          failure_count: plan.failure_count,
+        }
+      );
+    }
+    return {
+      performance: { id: fresh.id, name: fresh.name },
+      submitted: true,
+      success_count: plan.success_count,
+      failure_count: 0,
+      results: plan.results,
+    };
+  });
+});
+
 /* ---------------- 分发 ---------------- */
 
 async function handle(req, res, url, body) {
