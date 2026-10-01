@@ -992,6 +992,270 @@ route('POST', '/api/performances/:id/continue', (body, p) => {
   return continuePerformance(perf, target, operator, name);
 });
 
+/* ---- 成组连续处置（逐项预览 + 整组提交；与接续、单项操作同一 BEGIN IMMEDIATE 串行） ---- */
+
+const BATCH_ACTIONS = {
+  fire: 'fired',
+  skip: 'skipped',
+  retract: 'retracted',
+};
+const BATCH_ACTION_TEXT = { fire: '触发', skip: '跳过', retract: '撤回' };
+
+/** 取可操作演出；只读（已接续）演出拒绝（预览 / 提交均拒绝），错误附接续演出位置 */
+function getActivePerformance(performanceId) {
+  const perf = db.prepare('SELECT * FROM performances WHERE id = ?').get(performanceId);
+  if (!perf) throw new HttpError(404, '演出不存在');
+  assertActiveInTx(perf);
+  return perf;
+}
+
+/**
+ * 解析成组请求体：
+ *  - operator 必填（本组操作人，所有流水共用，与单项接口一致 trim 后非空）；
+ *  - items 必须为非空数组；每项含 label（编号）、action（fire/skip/retract）、reason；
+ *  - 空编号、重复编号、非法动作直接 400（空清单或重复编号须拒绝）。
+ * 编号不存在等逐项可行性问题留给 evaluateBatch 按步骤判定（附序号、编号、原因）。
+ */
+function parseBatchBody(body) {
+  const operator = String(body.operator || '').trim().slice(0, 50);
+  if (!operator) throw new HttpError(400, '请填写本组操作人');
+  if (!Array.isArray(body.items)) throw new HttpError(400, '请求格式错误：items 应为数组');
+  if (body.items.length === 0) throw new HttpError(400, '成组操作清单为空：至少添加一项处置');
+  if (body.items.length > 500) throw new HttpError(400, '成组操作条目过多（单次上限 500）');
+
+  const items = body.items.map((raw, i) => {
+    const seq = i + 1;
+    const action = String((raw && raw.action) || '').trim();
+    if (!BATCH_ACTIONS[action]) {
+      throw new HttpError(400, `第 ${seq} 项操作非法：action 应为 fire（触发）/skip（跳过）/retract（撤回）之一`);
+    }
+    const label = String((raw && raw.label) != null ? raw.label : '').trim().slice(0, 50);
+    if (!label) throw new HttpError(400, `第 ${seq} 项提示编号为空`);
+    const reason = String((raw && raw.reason) != null ? raw.reason : '').trim().slice(0, 200);
+    return { seq, label, action, reason };
+  });
+
+  const seen = new Set();
+  const duplicates = [];
+  for (const it of items) {
+    if (seen.has(it.label)) {
+      if (!duplicates.includes(it.label)) duplicates.push(it.label);
+    }
+    seen.add(it.label);
+  }
+  if (duplicates.length) {
+    throw new HttpError(400, `成组清单中编号重复，同一提示每组只能出现一次：${duplicates.join('、')}`, {
+      duplicates,
+    });
+  }
+  return { operator, items };
+}
+
+/**
+ * 逐项判定核心：按清单顺序，每一步基于"数据库当前有效结果 + 本组前面步骤已产生的有效结果"
+ * 判定前置、下游与待复核限制；失败的步骤不产生虚拟结果，后续步骤继续判定。
+ * 纯读 + 内存推演，不写任何数据；提交时在 BEGIN IMMEDIATE 事务内对最新状态再跑一遍。
+ *
+ * 返回 { items: [ { seq, label, action, cue_id, ok, status, error, unmet, affected,
+ *                   current, request, needs_review, projected } ], ok }。
+ */
+function evaluateBatch(perf, items, operator) {
+  const versionCues = getVersionCues(perf.version_id);
+  const cueByLabel = new Map(versionCues.map((c) => [c.label, c]));
+  const version = db.prepare('SELECT version_number FROM versions WHERE id = ?').get(perf.version_id);
+
+  // 下游索引（label -> 直接以前者为前置的提示），撤回时 BFS 检查仍已触发的下游
+  const childrenOf = new Map();
+  for (const c of versionCues) {
+    for (const dep of c.deps) {
+      if (!childrenOf.has(dep)) childrenOf.set(dep, []);
+      childrenOf.get(dep).push(c);
+    }
+  }
+
+  // 数据库当前状态快照（提交调用时位于写事务内，读到的是最新已提交状态）
+  const latestByCue = latestEventsByCue(perf.id);
+  const pendingByCue = new Map();
+  for (const r of db.prepare(
+    "SELECT * FROM cue_review_requests WHERE performance_id = ? AND status = 'pending' ORDER BY id DESC"
+  ).all(perf.id)) {
+    if (!pendingByCue.has(r.cue_id)) pendingByCue.set(r.cue_id, r);
+  }
+
+  // 本组前面步骤产生的有效结果（虚拟事件直接写入 latestByCue，覆盖同提示的数据库旧结果）
+  const firedLabels = new Set();
+  for (const c of versionCues) {
+    const e = latestByCue.get(c.id);
+    if (e && e.action === 'fired') firedLabels.add(c.label);
+  }
+
+  const fail = (seq, label, action, status, error, extra) => ({
+    seq, label, action, ok: false, status, error, ...(extra || {}),
+  });
+
+  const results = [];
+  for (const it of items) {
+    const cue = cueByLabel.get(it.label);
+    if (!cue) {
+      results.push(fail(it.seq, it.label, it.action, 404,
+        `编号「${it.label}」不存在于本演出使用的执行单版本（v${version.version_number}）`));
+      continue;
+    }
+
+    // 跳过 / 撤回原因（与单项接口一致：缺失 400）
+    if ((it.action === 'skip' || it.action === 'retract') && !it.reason) {
+      const verb = it.action === 'skip' ? '跳过' : '撤回';
+      results.push(fail(it.seq, it.label, it.action, 400, `${verb}必须填写原因`, { cue_id: cue.id }));
+      continue;
+    }
+
+    const latest = latestByCue.get(cue.id) || null;
+    const currentAction = effectiveAction(latest);
+    const pending = pendingByCue.get(cue.id) || null;
+
+    // 触发：需双人复核的提示不得在成组处置中直接触发（不代为登记申请）
+    if (it.action === 'fire' && cue.needs_review) {
+      results.push(fail(it.seq, it.label, it.action, 409,
+        '该提示需双人复核，成组处置不能直接触发；请在执行台发起触发申请并由另一操作人确认',
+        { cue_id: cue.id, needs_review: true }));
+      continue;
+    }
+
+    // 待复核限制：待处理申请期间拒绝触发、跳过、撤回
+    if (pending) {
+      const verb = BATCH_ACTION_TEXT[it.action];
+      results.push(fail(it.seq, it.label, it.action, 409,
+        `该提示存在待复核的触发申请（申请人 ${pending.requested_by}，时间 ${pending.requested_at}），复核处置前不能${verb}`,
+        { cue_id: cue.id, request: pending }));
+      continue;
+    }
+
+    if (it.action === 'fire' || it.action === 'skip') {
+      if (currentAction) {
+        const where = latest && latest._virtual
+          ? `（本组第 ${latest._seq} 项已${ACTION_TEXT[currentAction]}）`
+          : `（操作人 ${latest.operator}，时间 ${latest.created_at}）`;
+        results.push(fail(it.seq, it.label, it.action, 409,
+          `该提示已有结果：${ACTION_TEXT[currentAction]}${where}`,
+          { cue_id: cue.id, current: latest }));
+        continue;
+      }
+      if (it.action === 'fire') {
+        // 前置是否满足以"当前有效结果为已触发"判定（含本组前序触发；跳过 / 撤回不满足）
+        const unmet = cue.deps.filter((d) => !firedLabels.has(d));
+        if (unmet.length) {
+          results.push(fail(it.seq, it.label, it.action, 422,
+            `前置提示未触发，无法触发：${unmet.join('、')}`, { cue_id: cue.id, unmet }));
+          continue;
+        }
+      }
+      const projected = it.action === 'fire' ? 'fired' : 'skipped';
+      latestByCue.set(cue.id, { action: projected, operator, created_at: null, _virtual: true, _seq: it.seq });
+      if (projected === 'fired') firedLabels.add(cue.label);
+      else firedLabels.delete(cue.label);
+      results.push({ seq: it.seq, label: it.label, action: projected, cue_id: cue.id, ok: true, status: 200, projected });
+      continue;
+    }
+
+    // retract：仅当前有效结果为已触发（含本组前序刚触发）可撤回
+    if (currentAction === 'skipped') {
+      const where = latest && latest._virtual
+        ? `（本组第 ${latest._seq} 项已跳过）`
+        : `（操作人 ${latest.operator}，时间 ${latest.created_at}）`;
+      results.push(fail(it.seq, it.label, it.action, 409,
+        `该提示当前结果为已跳过，不能撤回${where}`, { cue_id: cue.id, current: latest }));
+      continue;
+    }
+    if (currentAction !== 'fired') {
+      results.push(fail(it.seq, it.label, it.action, 409,
+        '该提示当前未处于已触发状态，不能撤回', { cue_id: cue.id, current: latest }));
+      continue;
+    }
+    // 下游保护：沿前置关系可达的后续提示中，仍有效"已触发"（含本组前序触发）的须先撤回
+    const affected = [];
+    const visited = new Set([cue.label]);
+    const queue = [cue.label];
+    while (queue.length) {
+      const curLabel = queue.shift();
+      for (const child of childrenOf.get(curLabel) || []) {
+        if (visited.has(child.label)) continue;
+        visited.add(child.label);
+        queue.push(child.label);
+        const ce = latestByCue.get(child.id);
+        if (ce && ce.action === 'fired') affected.push(child.label);
+      }
+    }
+    if (affected.length) {
+      results.push(fail(it.seq, it.label, it.action, 409,
+        `无法撤回：以下后续提示仍处于已触发状态，请先撤回：${affected.join('、')}`,
+        { cue_id: cue.id, affected }));
+      continue;
+    }
+    latestByCue.set(cue.id, { action: 'retracted', operator, created_at: null, _virtual: true, _seq: it.seq });
+    firedLabels.delete(cue.label);
+    results.push({ seq: it.seq, label: it.label, action: 'retracted', cue_id: cue.id, ok: true, status: 200, projected: 'retracted' });
+  }
+
+  return { items: results, ok: results.every((r) => r.ok) };
+}
+
+route('POST', '/api/performances/:id/batch/preview', (body, p) => {
+  const perf = getActivePerformance(Number(p.id));
+  const { operator, items } = parseBatchBody(body);
+  const evaluated = evaluateBatch(perf, items, operator);
+  return {
+    performance: { id: perf.id, name: perf.name, readonly: false },
+    operator,
+    ok: evaluated.ok,
+    items: evaluated.items,
+  };
+});
+
+/**
+ * 整组提交：BEGIN IMMEDIATE 内按最新状态重新逐项判定（与单项操作、接续串行）；
+ * 任一步失败即整体回滚、不产生任何流水，并指出第一个失败项的序号、编号与原因
+ * （HTTP 状态与该项单项操作一致），响应同时附完整逐项判定；全部通过才按序写入
+ * 与单项操作完全一致的执行流水（同表同列、同一操作人与各项原因）。
+ */
+function submitBatch(perf, items, operator) {
+  return withTx(() => {
+    const fresh = db.prepare('SELECT * FROM performances WHERE id = ?').get(perf.id);
+    assertActiveInTx(fresh);
+    const evaluated = evaluateBatch(fresh, items, operator);
+    if (!evaluated.ok) {
+      const f = evaluated.items.find((r) => !r.ok);
+      throw new HttpError(
+        f.status,
+        `成组操作失败：第 ${f.seq} 项（编号 ${f.label}，${BATCH_ACTION_TEXT[f.action]}）${f.error}`,
+        { failed_item: f, items: evaluated.items }
+      );
+    }
+    const ins = db.prepare(
+      'INSERT INTO cue_events (performance_id, cue_id, action, operator, reason) VALUES (?,?,?,?,?)'
+    );
+    const events = [];
+    // 判定顺序即写入顺序：逐项通过后依次留下与单项操作一致的流水
+    for (const r of evaluated.items) {
+      const reason = r.action === 'fired' ? null : items[r.seq - 1].reason;
+      const info = ins.run(fresh.id, r.cue_id, r.action, operator, reason);
+      events.push(db.prepare('SELECT * FROM cue_events WHERE id = ?').get(Number(info.lastInsertRowid)));
+    }
+    return {
+      performance_id: fresh.id,
+      operator,
+      ok: true,
+      items: evaluated.items.map((r, i) => ({ ...r, event: events[i] })),
+      events,
+    };
+  });
+}
+
+route('POST', '/api/performances/:id/batch', (body, p) => {
+  const perf = getActivePerformance(Number(p.id));
+  const { operator, items } = parseBatchBody(body);
+  return submitBatch(perf, items, operator);
+});
+
 /* ---------------- 分发 ---------------- */
 
 async function handle(req, res, url, body) {

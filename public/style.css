@@ -220,3 +220,15 @@ th { color: var(--muted); font-weight: 500; font-size: 13px; }
   border-radius: 8px; padding: 10px 14px; margin-bottom: 10px; font-size: 13px;
 }
 .carried-text { color: #6fc6d8; font-weight: 600; }
+
+/* 成组连续处置 */
+.batch-panel { border-left: 4px solid var(--accent); margin-bottom: 16px; }
+.batch-panel select, .batch-panel input { font-size: 13px; }
+.batch-table-wrap { overflow-x: auto; margin-top: 10px; }
+.batch-table { font-size: 13px; }
+.batch-table td, .batch-table th { padding: 6px 8px; vertical-align: middle; }
+.batch-table select { min-width: 150px; }
+.batch-table .batch-reason { width: 100%; min-width: 220px; }
+.batch-preview-table td, .batch-preview-table th { padding: 5px 8px; }
+tr.batch-row-fail td { background: rgba(176, 69, 90, 0.08); }
+.batch-preview-table .unmet { color: #f0b7c0; font-size: 12px; }
